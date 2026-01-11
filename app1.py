@@ -16,7 +16,12 @@ st.markdown(
     """
     <style>
     .block-container { padding-top: 1.2rem; padding-bottom: 2.5rem; }
-    .pp-subtle { color: rgba(49, 51, 63, 0.65); font-size: 0.95rem; }
+    .pp-subtle { 
+    color: #B74134; 
+    font-size: 0.95rem; 
+    font-weight: 500;
+}
+
     </style>
     """,
     unsafe_allow_html=True,
