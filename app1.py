@@ -371,8 +371,11 @@ def normalize_risk_score(contrib: dict, has_fcst: bool, has_onhand: bool):
 def show_contrib_chart(contrib: dict, title: str = "Risk decomposition"):
     labels = list(contrib.keys())
     vals = [contrib[k] for k in labels]
+    col1, col2 = st.columns([1, 2])
+with col1:
+    st.pyplot(fig, clear_figure=True)
 
-    fig, ax = make_fig(5.5, 2.4)
+    fig, ax = make_fig(5.5, 2.4, dpi=110)
     ax.bar(labels, vals)
     ax.set_ylabel("Risk points")
     ax.set_title(title)
