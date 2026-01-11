@@ -372,7 +372,7 @@ def show_contrib_chart(contrib: dict, title: str = "Risk decomposition"):
     labels = list(contrib.keys())
     vals = [contrib[k] for k in labels]
 
-   fig, ax = make_fig(5.5, 2.4)   # smaller
+   fig, ax = make_fig(5.5, 2.4)
     ax.bar(labels, vals)
     ax.set_ylabel("Risk points")
     ax.set_title(title)
