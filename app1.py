@@ -286,7 +286,7 @@ work = work.dropna(subset=["__date", "__demand"]).copy()
 work = work.sort_values("__date")
 
 # =======================
-# Controls (Improvement #4: time-horizon awareness)
+# Controls (time-horizon awareness)
 # =======================
 st.subheader("3) Controls")
 a, b, c, d = st.columns([1, 1, 1, 1])
@@ -315,23 +315,18 @@ def to_weekly(slice_df: pd.DataFrame) -> pd.DataFrame:
     return weekly
 
 # =======================
-# Risk scoring (Improvement #1: explainable risk decomposition)
+# Risk scoring (explainable)
 # =======================
 def risk_decomposition(d_cv, fc_wape, fc_bias, weeks_cover):
-    """
-    Returns contributions + total risk score, fully explainable.
-    """
     contrib = {"Volatility": 0.0, "ForecastError": 0.0, "Bias": 0.0, "Cover": 0.0}
     reasons = []
 
-    # Volatility contribution
     if not np.isnan(d_cv):
         if d_cv >= 0.60:
             contrib["Volatility"] = 2.0; reasons.append("High volatility")
         elif d_cv >= 0.35:
             contrib["Volatility"] = 1.0; reasons.append("Moderate volatility")
 
-    # Forecast error + bias
     if not np.isnan(fc_wape):
         if fc_wape >= 0.35:
             contrib["ForecastError"] = 2.0; reasons.append("High forecast error")
@@ -341,7 +336,6 @@ def risk_decomposition(d_cv, fc_wape, fc_bias, weeks_cover):
     if not np.isnan(fc_bias) and abs(fc_bias) >= 0.10:
         contrib["Bias"] = 1.0; reasons.append("Bias risk")
 
-    # Cover contribution
     if not np.isnan(weeks_cover):
         if weeks_cover < 1.0:
             contrib["Cover"] = 2.0; reasons.append("Low cover (stockout risk)")
@@ -352,28 +346,53 @@ def risk_decomposition(d_cv, fc_wape, fc_bias, weeks_cover):
     top_reason = reasons[0] if reasons else "Stable"
     return total, contrib, top_reason, reasons
 
+def normalize_risk_score(contrib: dict, has_fcst: bool, has_onhand: bool):
+    """
+    Normalizes risk to 0–100 and adds a light penalty for missing signals so rankings are fair.
+    """
+    max_points = 2.0 + 2.0 + 1.0 + 2.0  # Vol + FcErr + Bias + Cover = 7
+    raw = float(sum(contrib.values()))
+
+    missing_penalty = 0.0
+    if not has_fcst:
+        missing_penalty += 0.5
+    if not has_onhand:
+        missing_penalty += 0.5
+
+    adj = raw + missing_penalty
+    score_0_100 = 100.0 * adj / (max_points + 1.0)  # +1 headroom for penalties
+    score_0_100 = float(np.clip(score_0_100, 0, 100))
+
+    signals = []
+    signals.append("Forecast" if has_fcst else "NoForecast")
+    signals.append("Inventory" if has_onhand else "NoInventory")
+    return score_0_100, " | ".join(signals), missing_penalty
+
 def show_contrib_chart(contrib: dict, title: str = "Risk decomposition"):
     labels = list(contrib.keys())
     vals = [contrib[k] for k in labels]
-    fig = plt.figure()
-    plt.bar(labels, vals)
-    plt.ylabel("Risk points")
-    plt.title(title)
-    plt.ylim(0, max(3, max(vals) + 0.5))
-    plt.xticks(rotation=20, ha="right")
-    plt.tight_layout()
-    st.pyplot(fig)
+
+    fig, ax = plt.subplots()
+    ax.bar(labels, vals)
+    ax.set_ylabel("Risk points")
+    ax.set_title(title)
+    ax.set_ylim(0, max(3, max(vals) + 0.5))
+    ax.tick_params(axis="x", rotation=20)
+    fig.tight_layout()
+
+    st.pyplot(fig, clear_figure=True)
+    plt.close(fig)
 
 # =======================
 # Top 10 risk SKUs
 # =======================
+rank = pd.DataFrame()  # for exception log export
 if show_top10 and sku_col != "(none)":
     st.subheader("4) Top 10 problem SKUs (auto-ranked)")
     region_df = work[work["__region"] == region_sel].copy()
 
-    # safety: if too many SKUs, sample top by total demand
     sku_counts = region_df.groupby("__sku")["__demand"].sum().sort_values(ascending=False)
-    candidate_skus = sku_counts.head(300).index.tolist()  # keep compute fast
+    candidate_skus = sku_counts.head(300).index.tolist()
 
     rows = []
     for sku in candidate_skus:
@@ -395,7 +414,6 @@ if show_top10 and sku_col != "(none)":
         else:
             fc_wape, fc_bias = np.nan, np.nan
 
-        # weeks cover (if onhand exists)
         weeks_cover = np.nan
         if onhand_col != "(none)":
             onhand = safe_num(s["__onhand"]).dropna()
@@ -404,46 +422,84 @@ if show_top10 and sku_col != "(none)":
 
         total_score, contrib, top_reason, _reasons = risk_decomposition(d_cv, fc_wape, fc_bias, weeks_cover)
 
+        has_onhand = (onhand_col != "(none)") and (not np.isnan(weeks_cover))
+        risk_0_100, signals_present, miss_pen = normalize_risk_score(contrib, has_fcst, has_onhand)
+
         rows.append({
             "SKU": sku,
             "RiskScore": total_score,
+            "RiskScore_0_100": risk_0_100,
+            "Signals": signals_present,
+            "MissingPenalty": miss_pen,
             "Volatility_CV": d_cv,
             "Forecast_WAPE": fc_wape,
             "Forecast_Bias": fc_bias,
             "Weeks_Cover": weeks_cover,
             "TopReason": top_reason,
-            # expose explainability columns
             "Pts_Vol": contrib["Volatility"],
             "Pts_FcErr": contrib["ForecastError"],
             "Pts_Bias": contrib["Bias"],
             "Pts_Cover": contrib["Cover"],
         })
 
-    rank = pd.DataFrame(rows).sort_values(["RiskScore", "Volatility_CV"], ascending=False).head(10)
+    rank = pd.DataFrame(rows).sort_values(
+        ["RiskScore_0_100", "RiskScore", "Volatility_CV"], ascending=False
+    ).head(10)
 
     if rank.empty:
         st.info("Not enough data to rank SKUs. Try increasing the horizon or check your SKU mapping.")
     else:
         st.dataframe(rank, use_container_width=True)
 
-        # small visual: bar chart of risk scores
-        fig = plt.figure()
-        plt.barh(rank["SKU"][::-1], rank["RiskScore"][::-1])
-        plt.xlabel("Risk Score")
-        plt.tight_layout()
-        st.pyplot(fig)
+        fig, ax = plt.subplots()
+        ax.barh(rank["SKU"][::-1], rank["RiskScore_0_100"][::-1])
+        ax.set_xlabel("Risk Score (0–100)")
+        fig.tight_layout()
+        st.pyplot(fig, clear_figure=True)
+        plt.close(fig)
 
-        # Improvement #1: click-to-explain (select SKU in Top10)
         st.markdown("**Explain a ranked SKU**")
         sku_explain = st.selectbox("Pick from Top 10", rank["SKU"].tolist(), index=0)
         row = rank[rank["SKU"] == sku_explain].iloc[0].to_dict()
-        contrib = {
+        contrib_explain = {
             "Volatility": float(row["Pts_Vol"]),
             "ForecastError": float(row["Pts_FcErr"]),
             "Bias": float(row["Pts_Bias"]),
             "Cover": float(row["Pts_Cover"]),
         }
-        show_contrib_chart(contrib, title=f"Risk decomposition — {sku_explain}")
+        show_contrib_chart(contrib_explain, title=f"Risk decomposition — {sku_explain}")
+
+        st.markdown("**Download exception log (for weekly planning cadence)**")
+        exception_log = rank.copy()
+        exception_log["Owner"] = np.where(
+            exception_log["TopReason"].str.contains("cover|stockout|excess", case=False, na=False),
+            "Inventory",
+            np.where(
+                exception_log["TopReason"].str.contains("forecast|bias|error", case=False, na=False),
+                "Demand Planning",
+                "Demand Planning"
+            )
+        )
+        exception_log["SuggestedAction"] = np.where(
+            exception_log["TopReason"].str.contains("Low cover", case=False, na=False),
+            "Expedite / reallocate / raise safety stock (short-term)",
+            np.where(
+                exception_log["TopReason"].str.contains("Excess", case=False, na=False),
+                "Reduce POs / run-down plan / redeploy / markdown",
+                np.where(
+                    exception_log["TopReason"].str.contains("Bias", case=False, na=False),
+                    "Calibrate overrides / fix baseline assumptions",
+                    "Review drivers / segmentation / event calendar"
+                )
+            )
+        )
+
+        st.download_button(
+            "Download exception log (CSV)",
+            data=exception_log.to_csv(index=False).encode("utf-8"),
+            file_name="planpulse_exception_log.csv",
+            mime="text/csv",
+        )
 
     st.divider()
 
@@ -468,9 +524,6 @@ weekly = to_weekly(view)
 weekly_exec = weekly.tail(exec_weeks).copy()
 weekly_plan = weekly.tail(plan_weeks).copy()
 
-# =======================
-# Diagnostics for both horizons (Improvement #4)
-# =======================
 def compute_kpis(wk: pd.DataFrame):
     dmean = float(wk["demand"].mean()) if len(wk) else np.nan
     d_cv = cv(wk["demand"].values) if len(wk) else np.nan
@@ -483,14 +536,13 @@ def compute_kpis(wk: pd.DataFrame):
     else:
         fc_wape, fc_bias = np.nan, np.nan
 
-    # weeks cover (use latest onhand vs mean demand of horizon)
     weeks_cover = np.nan
     if onhand_col != "(none)":
         onhand = view["__onhand"].dropna()
         if len(onhand) and dmean and dmean > 0:
             weeks_cover = float(onhand.iloc[-1]) / dmean
 
-    pattern, pattern_cv, zero_rate = pattern_classification(wk["demand"].values)
+    pattern, _pattern_cv, zero_rate = pattern_classification(wk["demand"].values)
 
     return {
         "dmean": dmean, "d_cv": d_cv,
@@ -505,7 +557,7 @@ k_exec = compute_kpis(weekly_exec)
 k_plan = compute_kpis(weekly_plan)
 
 # =======================
-# Situation Overview (Improvement #4 + #3)
+# Situation Overview
 # =======================
 st.subheader("6) Situation Overview")
 
@@ -527,7 +579,6 @@ with topR:
     p3.metric("Forecast WAPE", "N/A" if np.isnan(k_plan["fc_wape"]) else f"{k_plan['fc_wape']:.1%}")
     p4.metric("Forecast bias", "N/A" if np.isnan(k_plan["fc_bias"]) else f"{k_plan['fc_bias']:+.1%}")
 
-# Improvement #3: Demand pattern badge
 pattern = k_exec["pattern"]
 zero_rate = k_exec["zero_rate"]
 st.markdown(
@@ -540,24 +591,24 @@ st.markdown(
 
 with st.container(border=True):
     st.markdown("**Demand & forecast trend (Execution horizon)**")
-    fig = plt.figure()
-    plt.plot(weekly_exec["date"], weekly_exec["demand"], label="Demand")
+    fig, ax = plt.subplots()
+    ax.plot(weekly_exec["date"], weekly_exec["demand"], label="Demand")
     if k_exec["has_fcst"]:
-        plt.plot(weekly_exec["date"], weekly_exec["forecast"], label="Forecast")
-    plt.xticks(rotation=25, ha="right")
-    plt.legend()
-    plt.tight_layout()
-    st.pyplot(fig)
+        ax.plot(weekly_exec["date"], weekly_exec["forecast"], label="Forecast")
+    ax.tick_params(axis="x", rotation=25)
+    ax.legend()
+    fig.tight_layout()
+    st.pyplot(fig, clear_figure=True)
+    plt.close(fig)
 
 # =======================
-# Planner Override Simulation (Improvement #5)
+# Planner Override Simulation (What-if)
 # =======================
 st.subheader("6.5) Planner Override Simulation (What-if)")
 
 with st.container(border=True):
-    colA, colB, colC = st.columns([1, 1, 1])
+    colA, colB, colC, colD = st.columns([1, 1, 1, 1])
 
-    # Forecast multiplier sim
     if forecast_col != "(none)":
         with colA:
             fc_mult = st.slider("Forecast override (multiplier)", 0.70, 1.30, 1.00, 0.01)
@@ -566,19 +617,28 @@ with st.container(border=True):
         with colA:
             st.info("No forecast column → override simulation disabled.")
 
-    # Target cover sim
     with colB:
         target_cover = st.slider("Target weeks of cover", 0.5, 12.0, 4.0, 0.5)
 
-    # Service/cost preference knob (optional but useful)
     with colC:
         preference = st.selectbox("Decision preference", ["Balanced", "Service-first", "Cash-first"], index=0)
 
-    # Apply override to execution horizon only (most realistic)
+    with colD:
+        override_scope = st.selectbox(
+            "Apply override to",
+            ["Execution horizon only", "Next 4 weeks only"],
+            index=0
+        )
+
     wk_sim = weekly_exec.copy()
     if forecast_col != "(none)" and wk_sim["forecast"].notna().any():
-        wk_sim["forecast_sim"] = wk_sim["forecast"] * fc_mult
-        # recompute accuracy/bias on simulated forecast
+        wk_sim["forecast_sim"] = wk_sim["forecast"].copy()
+
+        if override_scope == "Next 4 weeks only" and len(wk_sim) >= 4:
+            wk_sim.loc[wk_sim.index[-4:], "forecast_sim"] = wk_sim.loc[wk_sim.index[-4:], "forecast"] * fc_mult
+        else:
+            wk_sim["forecast_sim"] = wk_sim["forecast"] * fc_mult
+
         w_fc = wk_sim.dropna(subset=["forecast_sim"])
         sim_wape = wape(w_fc["demand"].values, w_fc["forecast_sim"].values) if len(w_fc) else np.nan
         sim_bias = bias_ratio(w_fc["demand"].values, w_fc["forecast_sim"].values) if len(w_fc) else np.nan
@@ -586,12 +646,9 @@ with st.container(border=True):
         sim_wape, sim_bias = np.nan, np.nan
 
 # =======================
-# Problem detection + decision
-#   - Uses explainable decomposition (Improvement #1)
-#   - Uses pattern-aware logic (Improvement #3)
-#   - Quantifies trade-offs (Improvement #2)
+# Decision engine (fixed: no hidden global dependencies)
 # =======================
-def decision_engine(kpis_exec, sim_wape, sim_bias, target_cover, preference="Balanced"):
+def decision_engine(kpis_exec, weekly_exec_df, sim_wape, sim_bias, target_cover, preference="Balanced"):
     problems = []
     owners = []
 
@@ -600,24 +657,20 @@ def decision_engine(kpis_exec, sim_wape, sim_bias, target_cover, preference="Bal
     fc_bias = sim_bias if not np.isnan(sim_bias) else kpis_exec["fc_bias"]
     weeks_cover = kpis_exec["weeks_cover"]
 
-    # explainable risk
     total_score, contrib, top_reason, reasons = risk_decomposition(d_cv, fc_wape, fc_bias, weeks_cover)
 
-    # pattern-aware notes
     pattern = kpis_exec["pattern"]
     if pattern in ["Intermittent", "Lumpy"]:
-        problems.append(f"Demand pattern is {pattern} — error will be structurally higher; consider intermittent methods (e.g., Croston/TSB) or order-based planning.")
-        # small risk bump (explainable): add to volatility bucket
+        problems.append(
+            f"Demand pattern is {pattern} — error will be structurally higher; consider intermittent methods (e.g., Croston/TSB) or order-based planning."
+        )
         contrib["Volatility"] += 0.5
-        total_score += 0.5
 
-    # volatility narrative
     if not np.isnan(d_cv) and d_cv >= 0.60:
         problems.append("High demand volatility — near-term execution risk elevated (allocation/review cadence).")
     elif not np.isnan(d_cv) and d_cv >= 0.35:
         problems.append("Moderate volatility — monitor; tighten assumptions and event calendar.")
 
-    # forecast narrative
     if not np.isnan(fc_wape):
         if fc_wape >= 0.35:
             problems.append("Forecast error is high (WAPE ≥ 35%) — refresh drivers/model; review promo/events, NPI, substitution.")
@@ -626,7 +679,6 @@ def decision_engine(kpis_exec, sim_wape, sim_bias, target_cover, preference="Bal
     if not np.isnan(fc_bias) and abs(fc_bias) >= 0.10:
         problems.append("Systematic bias detected (|bias| ≥ 10%) — calibrate overrides / safety stock assumptions.")
 
-    # cover narrative + target-aware
     cover_gap = np.nan
     if not np.isnan(weeks_cover):
         cover_gap = weeks_cover - target_cover
@@ -637,17 +689,15 @@ def decision_engine(kpis_exec, sim_wape, sim_bias, target_cover, preference="Bal
             problems.append(f"Cover is high vs target ({weeks_cover:.1f}w vs {target_cover:.1f}w) — excess/obsolescence risk.")
             contrib["Cover"] = max(contrib["Cover"], 1.0)
 
-    # Decision mode logic (preference-aware)
     decision_mode = "Balanced"
     tradeoff = "Take targeted actions while monitoring signals."
     confidence = "High"
 
-    if len(weekly_exec) < 6:
+    if len(weekly_exec_df) < 6:
         confidence = "Low"
     elif np.isnan(fc_wape) and np.isnan(d_cv):
         confidence = "Medium"
 
-    # base triggers
     service_trigger = (
         (not np.isnan(weeks_cover) and weeks_cover < 1.0) or
         (not np.isnan(fc_wape) and fc_wape >= 0.35) or
@@ -686,7 +736,6 @@ def decision_engine(kpis_exec, sim_wape, sim_bias, target_cover, preference="Bal
             "Cross-functional: short weekly check on high-impact SKUs and constraints",
         ]
 
-    # finalize totals after pattern bump/cover adjustments
     total_score = float(sum(contrib.values()))
     return {
         "decision_mode": decision_mode,
@@ -702,18 +751,38 @@ def decision_engine(kpis_exec, sim_wape, sim_bias, target_cover, preference="Bal
         "cover_gap": cover_gap,
     }
 
-decision = decision_engine(k_exec, sim_wape, sim_bias, target_cover, preference=preference)
+# Latest values (for LT-aware adjustments & business impact)
+onhand_latest = np.nan
+unit_cost_latest = np.nan
+lt_latest = np.nan
+
+if onhand_col != "(none)":
+    oh = view["__onhand"].dropna()
+    if len(oh):
+        onhand_latest = float(oh.iloc[-1])
+
+if cost_col != "(none)":
+    uc = view["__cost"].dropna()
+    if len(uc):
+        unit_cost_latest = float(uc.iloc[-1])
+
+if lt_col != "(none)":
+    lt = view["__lt"].dropna()
+    if len(lt):
+        lt_latest = float(lt.iloc[-1])
+
+decision = decision_engine(k_exec, weekly_exec, sim_wape, sim_bias, target_cover, preference=preference)
+
+# Lead-time realism: long LT reduces execution feasibility (service mode)
+if not np.isnan(lt_latest) and lt_latest > 35 and decision["decision_mode"] == "Service":
+    decision["problems"] = ["Long lead time — inventory changes may not land in time; consider allocation/expedite."] + decision["problems"]
+    if decision["confidence"] == "High":
+        decision["confidence"] = "Medium"
 
 # =======================
-# Quantified impact estimates (Improvement #2)
+# Quantified impact estimates
 # =======================
 def quantify_tradeoffs(decision_mode, weeks_cover, target_cover, onhand_latest, unit_cost_latest):
-    """
-    Heuristic but planner-friendly impact estimation:
-    - If excess: suggest reducing toward target (or 6w cap)
-    - If low: suggest raising toward target (or 2w minimum)
-    Outputs: inventory delta units, cash delta, and rough service delta points.
-    """
     impact = {
         "inv_delta_units": np.nan,
         "cash_delta": np.nan,
@@ -723,7 +792,6 @@ def quantify_tradeoffs(decision_mode, weeks_cover, target_cover, onhand_latest, 
     if np.isnan(weeks_cover) or np.isnan(onhand_latest):
         return impact
 
-    # choose desired cover based on mode
     if decision_mode == "Cost/Cash":
         desired_cover = min(6.0, target_cover)
     elif decision_mode == "Service":
@@ -731,45 +799,30 @@ def quantify_tradeoffs(decision_mode, weeks_cover, target_cover, onhand_latest, 
     else:
         desired_cover = target_cover
 
-    # estimate units to move based on cover gap
-    # onhand = cover * mean_demand; so delta_onhand ~ (desired-cover) * mean_demand
-    # but we don't have mean demand here; approximate by onhand/cover
     if weeks_cover <= 0:
         return impact
 
     mean_demand_est = onhand_latest / weeks_cover
     inv_target = desired_cover * mean_demand_est
-    inv_delta = inv_target - onhand_latest  # + means build, - means reduce
+    inv_delta = inv_target - onhand_latest  # + build, - reduce
 
-    impact["inv_delta_units"] = inv_delta
+    impact["inv_delta_units"] = float(inv_delta)
+
+    # cap unrealistic swings
+    cap = onhand_latest * 0.75
+    impact["inv_delta_units"] = float(np.clip(impact["inv_delta_units"], -cap, cap))
 
     if not np.isnan(unit_cost_latest):
-        impact["cash_delta"] = -inv_delta * unit_cost_latest  # reducing inv => +cash
+        impact["cash_delta"] = -impact["inv_delta_units"] * unit_cost_latest  # reducing inv => +cash
 
-    # Rough service delta:
-    # if building inventory from low cover, service improves; if cutting from high, service may reduce slightly
-    # Keep this conservative and readable.
     if decision_mode == "Service":
-        # gain up to +3 points
         impact["service_delta_pts"] = clamp((desired_cover - weeks_cover) * 1.0, -0.5, 3.0)
     elif decision_mode == "Cost/Cash":
-        # lose up to -2 points (conservative)
         impact["service_delta_pts"] = clamp((desired_cover - weeks_cover) * 0.5, -2.0, 0.5)
     else:
         impact["service_delta_pts"] = clamp((desired_cover - weeks_cover) * 0.3, -1.0, 1.0)
 
     return impact
-
-onhand_latest = np.nan
-unit_cost_latest = np.nan
-if onhand_col != "(none)":
-    oh = view["__onhand"].dropna()
-    if len(oh):
-        onhand_latest = float(oh.iloc[-1])
-if cost_col != "(none)":
-    uc = view["__cost"].dropna()
-    if len(uc):
-        unit_cost_latest = float(uc.iloc[-1])
 
 impact = quantify_tradeoffs(
     decision_mode=decision["decision_mode"],
@@ -780,7 +833,7 @@ impact = quantify_tradeoffs(
 )
 
 # =======================
-# Recommendation Output (with improvements 1–5 surfaced)
+# Recommendation Output
 # =======================
 st.subheader("7) Recommendation")
 
@@ -791,7 +844,6 @@ with st.container(border=True):
     z.metric("Confidence", decision["confidence"])
     st.write("**Accepted trade-off:**", decision["tradeoff"])
 
-    # tags
     tags = []
     tags.append("📈 Volatile" if (not np.isnan(k_exec["d_cv"]) and k_exec["d_cv"] >= 0.35) else "📉 Stable")
     tags.append("🎯 Forecast risk" if (not np.isnan(decision["fc_wape_used"]) and decision["fc_wape_used"] >= 0.20) else "✅ Forecast OK / N/A")
@@ -804,10 +856,18 @@ with st.container(border=True):
         else:
             tags.append("📦 On target cover")
 
+    if not np.isnan(lt_latest):
+        tags.append(f"⏱️ LT {lt_latest:.0f}d")
+
     tags.append(f"🧭 Pref: {preference}")
     st.caption(" | ".join(tags))
 
-# Improvement #1: show decomposition
+with st.expander("Metric definitions (quick reference)"):
+    st.write("**WAPE** = Σ|A−F| / Σ|A|. Scale-independent forecast error.")
+    st.write("**Bias** = Σ(F−A) / Σ(A). Positive = over-forecast; Negative = under-forecast.")
+    st.write("**CV** = stdev / mean. Higher CV = more volatility.")
+    st.write("**Weeks of cover** = On-hand / Avg weekly demand (in selected horizon).")
+
 with st.container(border=True):
     st.markdown("**Why this recommendation? (Explainable risk decomposition)**")
     st.write(
@@ -816,7 +876,6 @@ with st.container(border=True):
     )
     show_contrib_chart(decision["contrib"], title=f"Risk decomposition — {sku_sel} (Execution horizon)")
 
-# Improvement #2: quantified impact
 with st.container(border=True):
     st.markdown("**Estimated business impact (heuristic)**")
     c1, c2, c3, c4 = st.columns(4)
@@ -831,7 +890,6 @@ with st.container(border=True):
     if not np.isnan(impact["service_delta_pts"]):
         st.caption(f"Service impact (rough): {impact['service_delta_pts']:+.1f} pts (conservative estimate)")
 
-# Problem overview
 with st.container(border=True):
     st.markdown("**Problem overview (auto-detected)**")
     if decision["problems"]:
@@ -840,14 +898,25 @@ with st.container(border=True):
     else:
         st.write("No major issues detected in the selected window.")
 
-# Owners
 with st.container(border=True):
     st.markdown("**Who should act next**")
     for o in decision["owners"]:
         st.write("•", o)
 
+st.text_area(
+    "Planner note (copy/paste into Demand Review)",
+    value=(
+        f"SKU {sku_sel} | Region {region_sel}\n"
+        f"Mode: {decision['decision_mode']} | Score: {decision['score']:.1f} | Confidence: {decision['confidence']}\n"
+        f"Drivers: {decision['top_reason']} | Pattern: {k_exec['pattern']}\n"
+        f"Key issues: {'; '.join(decision['problems'][:3]) if decision['problems'] else 'None'}\n"
+        f"Next actions: {decision['owners'][0] if decision['owners'] else 'N/A'}"
+    ),
+    height=140
+)
+
 # =======================
-# Export (include new features)
+# Export
 # =======================
 export = pd.DataFrame([{
     "region": region_sel,
@@ -862,6 +931,7 @@ export = pd.DataFrame([{
     "forecast_bias_used": decision["fc_bias_used"],
     "weeks_cover_exec": k_exec["weeks_cover"],
     "target_cover": target_cover,
+    "lead_time_days_latest": lt_latest,
     "decision_preference": preference,
     "decision_mode": decision["decision_mode"],
     "decision_score": decision["score"],
