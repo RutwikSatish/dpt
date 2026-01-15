@@ -15,9 +15,9 @@ st.markdown(
     """
     <style>
     .block-container { padding-top: 1.2rem; padding-bottom: 2.5rem; }
-    .pp-subtle { 
-        color: #B74134; 
-        font-size: 0.95rem; 
+    .pp-subtle {
+        color: #B74134;
+        font-size: 0.95rem;
         font-weight: 500;
     }
     .pp-pill {
@@ -303,6 +303,18 @@ with c:
 with d:
     show_top10 = st.toggle("Show Top 10 problem SKUs", value=True)
 
+# Chart view control (small default, optional large)
+chart_size_mode = st.radio("Chart view", ["Standard", "Large"], index=0, horizontal=True)
+
+if chart_size_mode == "Large":
+    CH_W, CH_H, CH_DPI = 9.5, 4.2, 120
+    FONT_TICK = 11
+    FONT_TITLE = 13
+else:
+    CH_W, CH_H, CH_DPI = 5.2, 2.4, 110
+    FONT_TICK = 9
+    FONT_TITLE = 11
+
 exec_weeks = int(exec_window)
 plan_weeks = int(plan_window)
 
@@ -372,19 +384,17 @@ def show_contrib_chart(contrib: dict, title: str = "Risk decomposition"):
     labels = list(contrib.keys())
     vals = [contrib[k] for k in labels]
 
-    fig, ax = plt.subplots(figsize=(5.5, 2.4), dpi=110)
+    fig, ax = plt.subplots(figsize=(CH_W, CH_H), dpi=CH_DPI)
     ax.bar(labels, vals)
     ax.set_ylabel("Risk points")
-    ax.set_title(title)
+    ax.set_title(title, fontsize=FONT_TITLE)
     ax.set_ylim(0, max(3, max(vals) + 0.5))
-    ax.tick_params(axis="x", rotation=20)
+    ax.tick_params(axis="x", rotation=20, labelsize=FONT_TICK)
+    ax.tick_params(axis="y", labelsize=FONT_TICK)
     fig.tight_layout()
 
-    col1, col2 = st.columns([1, 2])  
-    with col1:
-        st.pyplot(fig, clear_figure=True)
+    st.pyplot(fig, clear_figure=True)
     plt.close(fig)
-
 
 # =======================
 # Top 10 risk SKUs
@@ -423,14 +433,13 @@ if show_top10 and sku_col != "(none)":
             if len(onhand) and dmean > 0:
                 weeks_cover = float(onhand.iloc[-1]) / dmean
 
-        total_score, contrib, top_reason, _reasons = risk_decomposition(d_cv, fc_wape, fc_bias, weeks_cover)
+        _total_score, contrib, top_reason, _reasons = risk_decomposition(d_cv, fc_wape, fc_bias, weeks_cover)
 
         has_onhand = (onhand_col != "(none)") and (not np.isnan(weeks_cover))
         risk_0_100, signals_present, miss_pen = normalize_risk_score(contrib, has_fcst, has_onhand)
 
         rows.append({
             "SKU": sku,
-            "RiskScore": total_score,
             "RiskScore_0_100": risk_0_100,
             "Signals": signals_present,
             "MissingPenalty": miss_pen,
@@ -446,7 +455,7 @@ if show_top10 and sku_col != "(none)":
         })
 
     rank = pd.DataFrame(rows).sort_values(
-        ["RiskScore_0_100", "RiskScore", "Volatility_CV"], ascending=False
+        ["RiskScore_0_100", "Volatility_CV"], ascending=False
     ).head(10)
 
     if rank.empty:
@@ -454,9 +463,12 @@ if show_top10 and sku_col != "(none)":
     else:
         st.dataframe(rank, use_container_width=True)
 
-        fig, ax = plt.subplots()
+        fig, ax = plt.subplots(figsize=(CH_W, CH_H), dpi=CH_DPI)
         ax.barh(rank["SKU"][::-1], rank["RiskScore_0_100"][::-1])
-        ax.set_xlabel("Risk Score (0–100)")
+        ax.set_xlabel("Risk Score (0-100)")
+        ax.tick_params(axis="x", labelsize=FONT_TICK)
+        ax.tick_params(axis="y", labelsize=FONT_TICK)
+        ax.set_title("Top 10 risk SKUs", fontsize=FONT_TITLE)
         fig.tight_layout()
         st.pyplot(fig, clear_figure=True)
         plt.close(fig)
@@ -594,12 +606,14 @@ st.markdown(
 
 with st.container(border=True):
     st.markdown("**Demand & forecast trend (Execution horizon)**")
-    fig, ax = plt.subplots()
+    fig, ax = plt.subplots(figsize=(CH_W, CH_H), dpi=CH_DPI)
     ax.plot(weekly_exec["date"], weekly_exec["demand"], label="Demand")
     if k_exec["has_fcst"]:
         ax.plot(weekly_exec["date"], weekly_exec["forecast"], label="Forecast")
-    ax.tick_params(axis="x", rotation=25)
-    ax.legend()
+    ax.tick_params(axis="x", rotation=25, labelsize=FONT_TICK)
+    ax.tick_params(axis="y", labelsize=FONT_TICK)
+    ax.legend(fontsize=FONT_TICK)
+    ax.set_title("Demand vs Forecast (execution horizon)", fontsize=FONT_TITLE)
     fig.tight_layout()
     st.pyplot(fig, clear_figure=True)
     plt.close(fig)
@@ -660,7 +674,7 @@ def decision_engine(kpis_exec, weekly_exec_df, sim_wape, sim_bias, target_cover,
     fc_bias = sim_bias if not np.isnan(sim_bias) else kpis_exec["fc_bias"]
     weeks_cover = kpis_exec["weeks_cover"]
 
-    total_score, contrib, top_reason, reasons = risk_decomposition(d_cv, fc_wape, fc_bias, weeks_cover)
+    _total_score, contrib, top_reason, _reasons = risk_decomposition(d_cv, fc_wape, fc_bias, weeks_cover)
 
     pattern = kpis_exec["pattern"]
     if pattern in ["Intermittent", "Lumpy"]:
